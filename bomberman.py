@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Terminal Bomberman.
 
-Run:      python3 bomberman.py
+Run:      python3 bomberman.py [--width W] [--height H] [--player EMOJI]
+          e.g. python3 bomberman.py --width 31 --height 15 --player 🐱
 Controls: arrows / WASD to move, SPACE to drop a bomb, P to pause, Q to quit.
 
 Clear every enemy, then find the exit door hidden under a brick to reach the
@@ -9,12 +10,17 @@ next level. Power-ups also hide under bricks:
   B = +1 bomb    F = +1 flame range    S = speed up
 """
 
+import argparse
 import curses
+import locale
 import random
 import time
+import unicodedata
 
 # ---------------------------------------------------------------- constants --
-W, H = 15, 13                 # board size in cells (odd, so pillars line up)
+DEFAULT_W, DEFAULT_H = 15, 13 # board size in cells (odd looks best: pillars line up)
+MIN_SIZE = 7
+DEFAULT_PLAYER = "🐱"
 EMPTY, WALL, BRICK = 0, 1, 2
 FUSE = 2.5                    # seconds before a bomb explodes
 FLAME_TIME = 0.5              # seconds fire stays on the board
@@ -44,7 +50,8 @@ class Enemy:
 class Game:
     """Pure game state and rules; knows nothing about curses."""
 
-    def __init__(self, seed=None, now=0.0):
+    def __init__(self, seed=None, now=0.0, width=DEFAULT_W, height=DEFAULT_H):
+        self.w, self.h = width, height
         self.rand = random.Random(seed)
         self.level = 1
         self.score = 0
@@ -59,6 +66,7 @@ class Game:
 
     # ---- setup
     def new_level(self, now):
+        W, H = self.w, self.h
         self.grid = [[EMPTY] * W for _ in range(H)]
         for y in range(H):
             for x in range(W):
@@ -71,6 +79,11 @@ class Game:
                     self.grid[y][x] = BRICK
 
         bricks = [(x, y) for y in range(H) for x in range(W) if self.grid[y][x] == BRICK]
+        if not bricks:                # tiny boards: make sure the door has a home
+            x, y = max((x, y) for y in range(H) for x in range(W)
+                       if self.grid[y][x] == EMPTY and (x, y) not in safe)
+            self.grid[y][x] = BRICK
+            bricks = [(x, y)]
         self.rand.shuffle(bricks)
         self.door = bricks.pop()
         self.door_revealed = False
@@ -291,8 +304,32 @@ def put(win, y, x, text, attr=0):
         pass   # writing to the bottom-right cell raises; ignore
 
 
-def draw(stdscr, g, now, color, paused):
+def text_width(s):
+    """Terminal columns taken by s (wide emoji count as 2, joiners/selectors as 0)."""
+    w, joined = 0, False
+    for ch in s:
+        if ch == "\ufe0f":            # emoji presentation: previous char renders wide
+            w += 1 if w % 2 else 0
+        elif ch == "\u200d":          # zero-width joiner: next glyph merges into this one
+            joined = True
+        elif unicodedata.combining(ch) or ch == "\ufe0e" or joined:
+            joined = False
+        else:
+            w += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return w
+
+
+def player_sprite(text):
+    """Pad the player's symbol to exactly one 2-column cell."""
+    w = text_width(text)
+    if not 1 <= w <= 2:
+        raise ValueError(f"player symbol {text!r} must be 1 or 2 columns wide (got {w})")
+    return text + " " * (2 - w)
+
+
+def draw(stdscr, g, now, color, paused, player):
     stdscr.erase()
+    W, H = g.w, g.h
     rows, cols = stdscr.getmaxyx()
     need_w, need_h = W * 2, H + 3
     if cols < need_w or rows < need_h:
@@ -319,7 +356,7 @@ def draw(stdscr, g, now, color, paused):
             elif p in g.fire:
                 s, a = "**", cp(C_FIRE) | B
             elif p == (g.px, g.py) and (g.alive or int(now * 8) % 2):
-                s, a = ("@@" if g.alive else "xx"), cp(C_PLAYER) | B
+                s, a = (player if g.alive else "xx"), cp(C_PLAYER) | B
             elif p in enemies:
                 s, a = "&&", cp(C_ENEMY) | B
             elif g.bomb_at(x, y):
@@ -359,12 +396,12 @@ KEYMAP = {
 }
 
 
-def main(stdscr):
+def main(stdscr, width, height, player):
     curses.curs_set(0)
     stdscr.keypad(True)
     stdscr.nodelay(True)
     color = init_colors()
-    g = Game(now=time.monotonic())
+    g = Game(now=time.monotonic(), width=width, height=height)
     paused = False
     pause_start = 0.0
     pending, pending_at = None, 0.0   # buffered direction so quick taps aren't lost
@@ -386,7 +423,7 @@ def main(stdscr):
                 else:
                     shift_time(g, now - pause_start)
             elif k in (ord("r"), ord("R")) and g.game_over:
-                g = Game(now=now)
+                g = Game(now=now, width=width, height=height)
             elif k == ord(" "):
                 bomb = True
             elif k in KEYMAP:
@@ -401,7 +438,7 @@ def main(stdscr):
                 g.move_player(*pending, now)
                 pending = None
             g.tick(now)
-        draw(stdscr, g, now, color, paused)
+        draw(stdscr, g, now, color, paused, player)
         curses.napms(30)
 
 
@@ -416,8 +453,29 @@ def shift_time(g, dt):
     g.message_until += dt
 
 
-if __name__ == "__main__":
+def parse_args(argv=None):
+    ap = argparse.ArgumentParser(description="Terminal Bomberman.")
+    ap.add_argument("--width", type=int, default=DEFAULT_W,
+                    help=f"board width in cells (min {MIN_SIZE}, default {DEFAULT_W})")
+    ap.add_argument("--height", type=int, default=DEFAULT_H,
+                    help=f"board height in cells (min {MIN_SIZE}, default {DEFAULT_H})")
+    ap.add_argument("--player", default=DEFAULT_PLAYER,
+                    help=f"emoji or 1-2 characters for the player (default {DEFAULT_PLAYER!r})")
+    args = ap.parse_args(argv)
+    for name in ("width", "height"):
+        if getattr(args, name) < MIN_SIZE:
+            ap.error(f"--{name} must be at least {MIN_SIZE}")
     try:
-        curses.wrapper(main)
+        args.player = player_sprite(args.player)
+    except ValueError as e:
+        ap.error(str(e))
+    return args
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    locale.setlocale(locale.LC_ALL, "")   # needed for curses to draw emoji
+    try:
+        curses.wrapper(main, args.width, args.height, args.player)
     except KeyboardInterrupt:
         pass
